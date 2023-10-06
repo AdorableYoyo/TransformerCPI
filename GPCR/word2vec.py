@@ -40,8 +40,15 @@ def get_protein_embedding(model,protein):
     vec = np.zeros((len(protein), 100))
     i = 0
     for word in protein:
-        vec[i, ] = model.wv[word]
-        i += 1
+        # vec[i, ] = model.wv[word]
+        # i += 1
+        if word in model.wv:  # Check if the word is in the vocabulary
+            vec[i, ] = model.wv[word]
+            i += 1
+        else:
+            # Handle the missing word, e.g., by skipping it or using a default vector
+            print("{} not in vocabulary".format(word))
+            pass
     return vec
 
 

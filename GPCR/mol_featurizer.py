@@ -83,14 +83,14 @@ if __name__ == "__main__":
     print(adj)
     """
     DATASET = "GPCR_train"
-    with open("../data/GPCR_train.txt","r") as f:
+    with open("/raid/home/yoyowu/transformerCPI/data/GPCR_train.txt","r") as f:
         data_list = f.read().strip().split('\n')
     """Exclude data contains '.' in the SMILES format."""
     data_list = [d for d in data_list if '.' not in d.strip().split()[0]]
     N = len(data_list)
 
     compounds, adjacencies,proteins,interactions = [], [], [], []
-    model = Word2Vec.load("word2vec_30.model")
+    model = Word2Vec.load("/raid/home/yoyowu/transformerCPI/GPCR/word2vec_30.model")
     for no, data in enumerate(data_list):
         print('/'.join(map(str, [no + 1, N])))
         smiles, sequence, interaction = data.strip().split(" ")
@@ -103,7 +103,7 @@ if __name__ == "__main__":
 
         protein_embedding = get_protein_embedding(model, seq_to_kmers(sequence))
         proteins.append(protein_embedding)
-    dir_input = ('dataset/' + DATASET + '/word2vec_30/')
+    dir_input = ('/raid/home/yoyowu/transformerCPI/dataset/' + DATASET + '/word2vec_30/')
     os.makedirs(dir_input, exist_ok=True)
     np.save(dir_input + 'compounds', compounds)
     np.save(dir_input + 'adjacencies', adjacencies)

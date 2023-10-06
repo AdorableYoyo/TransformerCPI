@@ -15,6 +15,8 @@ import numpy as np
 from sklearn.metrics import roc_auc_score, precision_score, recall_score,precision_recall_curve, auc
 from Radam import *
 from lookahead import Lookahead
+from torch.cuda.amp import autocast, GradScaler
+from itertools import islice
 
 
 class SelfAttention(nn.Module):
@@ -259,6 +261,7 @@ class Predictor(nn.Module):
         self.device = device
         self.weight = nn.Parameter(torch.FloatTensor(atom_dim, atom_dim))
         self.init_weight()
+        self.Loss= nn.CrossEntropyLoss()
 
     def init_weight(self):
         stdv = 1. / math.sqrt(self.weight.size(1))
@@ -275,6 +278,8 @@ class Predictor(nn.Module):
 
     def make_masks(self, atom_num, protein_num, compound_max_len, protein_max_len):
         N = len(atom_num)  # batch size
+        atom_num = atom_num.long()
+        protein_num = protein_num.long()
         compound_mask = torch.zeros((N, compound_max_len))
         protein_mask = torch.zeros((N, protein_max_len))
         for i in range(N):
@@ -285,10 +290,12 @@ class Predictor(nn.Module):
         return compound_mask, protein_mask
 
 
-    def forward(self, compound, adj,  protein,atom_num,protein_num):
+    def forward(self, data):
+        compound, adj, protein, correct_interaction, atom_num, protein_num = data
         # compound = [batch,atom_num, atom_dim]
         # adj = [batch,atom_num, atom_num]
         # protein = [batch,protein len, 100]
+
         compound_max_len = compound.shape[1]
         protein_max_len = protein.shape[1]
         compound_mask, protein_mask = self.make_masks(atom_num, protein_num, compound_max_len, protein_max_len)
@@ -301,36 +308,43 @@ class Predictor(nn.Module):
         enc_src = self.encoder(protein)
         # enc_src = [batch size, protein len, hid dim]
 
-        out = self.decoder(compound, enc_src, compound_mask, protein_mask)
+        predicted_interaction = self.decoder(compound, enc_src, compound_mask, protein_mask)
         # out = [batch size, 2]
         # out = torch.squeeze(out, dim=0)
-        return out
+        correct_interaction = correct_interaction.long()
+        ys = F.softmax(predicted_interaction, 1).to('cpu').data.numpy()
+        predicted_labels = np.argmax(ys, axis=1)
+        predicted_scores = ys[:, 1]
+        loss = self.Loss(predicted_interaction, correct_interaction)
+        return loss, correct_interaction, predicted_labels, predicted_scores
 
-    def __call__(self, data, train=True):
 
-        compound, adj, protein, correct_interaction ,atom_num,protein_num = data
-        # compound = compound.to(self.device)
-        # adj = adj.to(self.device)
-        # protein = protein.to(self.device)
-        # correct_interaction = correct_interaction.to(self.device)
-        Loss = nn.CrossEntropyLoss()
+    # def __call__(self, data, train=True):
 
-        if train:
-            predicted_interaction = self.forward(compound, adj, protein,atom_num,protein_num)
-            loss = Loss(predicted_interaction, correct_interaction)
-            return loss
+    #     compound, adj, protein, correct_interaction ,atom_num,protein_num = data
+    #     # compound = compound.to(self.device)
+    #     # adj = adj.to(self.device)
+    #     # protein = protein.to(self.device)
+    #     # correct_interaction = correct_interaction.to(self.device)
+    #     Loss = nn.CrossEntropyLoss()
 
-        else:
-            #compound = compound.unsqueeze(0)
-            #adj = adj.unsqueeze(0)
-            #protein = protein.unsqueeze(0)
-            #correct_interaction = correct_interaction.unsqueeze(0)
-            predicted_interaction = self.forward(compound, adj, protein,atom_num,protein_num)
-            correct_labels = correct_interaction.to('cpu').data.numpy()
-            ys = F.softmax(predicted_interaction, 1).to('cpu').data.numpy()
-            predicted_labels = np.argmax(ys, axis=1)
-            predicted_scores = ys[:, 1]
-            return correct_labels, predicted_labels, predicted_scores
+    #     if train:
+    #         predicted_interaction = self.forward(compound, adj, protein,atom_num,protein_num)
+    #         correct_interaction = correct_interaction.long()
+    #         loss = Loss(predicted_interaction, correct_interaction)
+    #         return loss
+
+    #     else:
+    #         #compound = compound.unsqueeze(0)
+    #         #adj = adj.unsqueeze(0)
+    #         #protein = protein.unsqueeze(0)
+    #         #correct_interaction = correct_interaction.unsqueeze(0)
+    #         predicted_interaction = self.forward(compound, adj, protein,atom_num,protein_num)
+    #         correct_labels = correct_interaction.to('cpu').data.numpy()
+    #         ys = F.softmax(predicted_interaction, 1).to('cpu').data.numpy()
+    #         predicted_labels = np.argmax(ys, axis=1)
+    #         predicted_scores = ys[:, 1]
+    #         return correct_labels, predicted_labels, predicted_scores
 
 
 def pack(atoms, adjs, proteins, labels, device):
@@ -372,7 +386,19 @@ def pack(atoms, adjs, proteins, labels, device):
         labels_new[i] = label
         i += 1
     return (atoms_new, adjs_new, proteins_new, labels_new, atom_num, protein_num)
+def to_cuda(data, device, cuda_available=True):
+    compound, adj, protein, correct_interaction, atom_num, protein_num = data
 
+    # Put input to cuda
+    if cuda_available:
+        compound = compound.to(device)
+        adj = adj.to(device)
+        protein = protein.to(device)
+        atom_num = atom_num.to(device)
+        protein_num = protein_num.to(device)
+        correct_interaction = correct_interaction.to(device)
+
+    return compound, adj, protein, correct_interaction, atom_num, protein_num
 
 class Trainer(object):
     def __init__(self, model, lr, weight_decay, batch):
@@ -395,66 +421,107 @@ class Trainer(object):
         self.optimizer = Lookahead(self.optimizer_inner, k=5, alpha=0.5)
         self.batch = batch
 
-    def train(self, dataset, device):
+    def train(self, dataloader, device):
+        scaler = GradScaler()
         self.model.train()
-        np.random.shuffle(dataset)
-        N = len(dataset)
-        loss_total = 0
-        i = 0
-        self.optimizer.zero_grad()
-        adjs, atoms, proteins, labels = [], [], [], []
-        for data in dataset:
-            i = i+1
-            atom, adj, protein, label = data
-            adjs.append(adj)
-            atoms.append(atom)
-            proteins.append(protein)
-            labels.append(label)
-            if i % 8 == 0 or i == N:
-                data_pack = pack(atoms, adjs, proteins, labels, device)
-                loss = self.model(data_pack)
-                # loss = loss / self.batch
-                loss.backward()
-                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10)
-                adjs, atoms, proteins, labels = [], [], [], []
-            else:
-                continue
-            if i % self.batch == 0 or i == N:
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-            loss_total += loss.item()
-        return loss_total
 
+        loss_train = 0
+        #for i, data_pack in enumerate(dataloader):
+        # sample 3000 batches
+        for i, data_pack in islice(enumerate(dataloader), 0, 1000):
+            data_pack = to_cuda(data_pack, device=device)
+            self.optimizer.zero_grad()
+            with autocast():  # Enable mixed precision for the forward pass
+                loss, _, _, _ = self.model(data_pack)
+            # Backward pass and optimization using the scaler
+            scaler.scale(loss).backward()
+            scaler.step(self.optimizer)
+            scaler.update()
+            
+            # with autocast():  # Enable mixed precision for the forward pass
+            #     predicted_interaction = model(compound, adj, protein)
+            #     loss = criterion(predicted_interaction, interaction)  # Assuming you have a loss function defined as 'criterion'
+            # try:
+                # loss.backward()
+                # self.optimizer.step()
+
+            # except RuntimeError as e:
+            #     if 'out of memory' in str(e):
+            #         print('| WARNING: ran out of GPU memory, skipping batch')
+            #         torch.cuda.empty_cache()
+            #     else:
+            #         print(e)
+
+            loss_train += loss.detach().mean().item()
+        
+
+        return loss.detach().sum().item()
+
+
+
+# class Tester(object):
+#     def __init__(self, model):
+#         self.model = model
+
+#     def test(self, dataset):
+#         self.model.eval()
+#         N = len(dataset)
+#         T, Y, S = [], [], []
+#         with torch.no_grad():
+#             for data in dataset:
+#                 adjs, atoms, proteins, labels = [], [], [], []
+#                 atom, adj, protein, label = data
+#                 adjs.append(adj)
+#                 atoms.append(atom)
+#                 proteins.append(protein)
+#                 labels.append(label)
+#                 data = pack(atoms,adjs,proteins, labels, self.model.device)
+#                 correct_labels, predicted_labels, predicted_scores = self.model(data, train=False)
+#                 T.extend(correct_labels)
+#                 Y.extend(predicted_labels)
+#                 S.extend(predicted_scores)
+#         AUC = roc_auc_score(T, S)
+#         tpr, fpr, _ = precision_recall_curve(T, S)
+#         PRC = auc(fpr, tpr)
+#         return AUC, PRC
+
+#     def save_AUCs(self, AUCs, filename):
+#         with open(filename, 'a') as f:
+#             f.write('\t'.join(map(str, AUCs)) + '\n')
+
+#     def save_model(self, model, filename):
+#         torch.save(model.state_dict(), filename)
 
 class Tester(object):
     def __init__(self, model):
         self.model = model
 
-    def test(self, dataset):
+    def test(self, dataloader, device, threshold=7., plot=False):
         self.model.eval()
-        N = len(dataset)
-        T, Y, S = [], [], []
+
+        #T, S, Y = torch.Tensor(), torch.Tensor(), torch.Tensor()
+        T, S, Y = [], [], []
         with torch.no_grad():
-            for data in dataset:
-                adjs, atoms, proteins, labels = [], [], [], []
-                atom, adj, protein, label = data
-                adjs.append(adj)
-                atoms.append(atom)
-                proteins.append(protein)
-                labels.append(label)
-                data = pack(atoms,adjs,proteins, labels, self.model.device)
-                correct_labels, predicted_labels, predicted_scores = self.model(data, train=False)
-                T.extend(correct_labels)
-                Y.extend(predicted_labels)
-                S.extend(predicted_scores)
+            for i, data_pack in enumerate(dataloader):
+                data_pack = to_cuda(data_pack, device=device)
+
+                _, correct_interaction, predicted_labels, predicted_scores = self.model(data_pack)
+
+                T.extend(correct_interaction.cpu().detach())
+                Y.extend(list(predicted_labels))
+                S.extend(list(predicted_scores))
+                #Y = torch.cat((S, predicted_labels.cpu().detach()))
+
         AUC = roc_auc_score(T, S)
         tpr, fpr, _ = precision_recall_curve(T, S)
         PRC = auc(fpr, tpr)
         return AUC, PRC
+
 
     def save_AUCs(self, AUCs, filename):
         with open(filename, 'a') as f:
             f.write('\t'.join(map(str, AUCs)) + '\n')
 
     def save_model(self, model, filename):
-        torch.save(model.state_dict(), filename)
+        torch.save(model.module.state_dict(), filename + ".state_dict")
+        torch.save(model, filename + ".entire_model")
