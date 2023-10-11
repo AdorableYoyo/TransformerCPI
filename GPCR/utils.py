@@ -32,21 +32,25 @@ def load_data_map(smiles_mapping_path, protein_seq_mapping_path, chembl_uniprot_
 
 
 class ProteinCompoundDataset(Dataset):
-    def __init__(self, data, smiles_mapping, protein_seq_mapping, chembl_uniprot_mapping):
+    def __init__(self, data, smiles_mapping, protein_seq_mapping, chembl_uniprot_mapping, unlabeled=False):
         self.data = data
         self.smiles_mapping = smiles_mapping
         self.protein_seq_mapping = protein_seq_mapping
         self.chembl_uniprot_mapping = chembl_uniprot_mapping
-        self.word_model = Word2Vec.load("/raid/home/yoyowu/transformerCPI/GPCR/word2vec_30.model")
+        self.word_model = Word2Vec.load("/raid/home/yoyowu/TransformerCPI/GPCR/word2vec_30.model")
+        self.unlabeled = unlabeled
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        compound_id, uniprot_id, label = self.data[idx]
-        # convert label to float if it is string 
-        if isinstance(label, str):
-            label = float(label)
+        if self.unlabeled:
+            compound_id, uniprot_id  = self.data[idx]
+        else:
+            compound_id, uniprot_id, label = self.data[idx]
+            # convert label to float if it is string 
+            if isinstance(label, str):
+                label = float(label)
         
         smiles = self.smiles_mapping.get(compound_id, None)
         
@@ -63,7 +67,10 @@ class ProteinCompoundDataset(Dataset):
             return None
         
         atom_feature, adj = mol_features(smiles)
-        return torch.tensor(atom_feature), torch.tensor(adj), protein_embedding, torch.tensor(int(label))
+        if self.unlabeled:
+            return torch.tensor(atom_feature), torch.tensor(adj), protein_embedding
+        else:
+            return torch.tensor(atom_feature), torch.tensor(adj), protein_embedding, torch.tensor(int(label))
 
 
 

@@ -401,15 +401,19 @@ def to_cuda(data, device, cuda_available=True):
     return compound, adj, protein, correct_interaction, atom_num, protein_num
 
 class Trainer(object):
-    def __init__(self, model, lr, weight_decay, batch):
+    def __init__(self, model, lr, weight_decay, batch, amp, checkpoint=None):
         self.model = model
         # w - L2 regularization ; b - not L2 regularization
         weight_p, bias_p = [], []
+        self.amp = amp
 
         for p in self.model.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-
+        if checkpoint is not None:
+            #self.model.load_state_dict(checkpoint)
+            self.model.load_state_dict(torch.load(checkpoint))
+            print('load model from checkpoint {}'.format(checkpoint))
         for name, p in self.model.named_parameters():
             if 'bias' in name:
                 bias_p += [p]
@@ -420,77 +424,36 @@ class Trainer(object):
             [{'params': weight_p, 'weight_decay': weight_decay}, {'params': bias_p, 'weight_decay': 0}], lr=lr)
         self.optimizer = Lookahead(self.optimizer_inner, k=5, alpha=0.5)
         self.batch = batch
+ 
 
     def train(self, dataloader, device):
         scaler = GradScaler()
         self.model.train()
 
-        loss_train = 0
+        total_loss = 0.0
+        num_batches = 0
         #for i, data_pack in enumerate(dataloader):
-        # sample 3000 batches
+        # sample few batches
         for i, data_pack in islice(enumerate(dataloader), 0, 1000):
             data_pack = to_cuda(data_pack, device=device)
             self.optimizer.zero_grad()
-            with autocast():  # Enable mixed precision for the forward pass
+            if self.amp:
+                with autocast():  # Enable mixed precision for the forward pass
+                    loss, _, _, _ = self.model(data_pack)
+            #Backward pass and optimization using the scaler
+                scaler.scale(loss).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
                 loss, _, _, _ = self.model(data_pack)
-            # Backward pass and optimization using the scaler
-            scaler.scale(loss).backward()
-            scaler.step(self.optimizer)
-            scaler.update()
-            
-            # with autocast():  # Enable mixed precision for the forward pass
-            #     predicted_interaction = model(compound, adj, protein)
-            #     loss = criterion(predicted_interaction, interaction)  # Assuming you have a loss function defined as 'criterion'
-            # try:
-                # loss.backward()
-                # self.optimizer.step()
+                loss.backward()
+                self.optimizer.step()
+            total_loss += loss.item()
+            num_batches += 1
+        average_loss = total_loss / num_batches
+        return average_loss     
+         
 
-            # except RuntimeError as e:
-            #     if 'out of memory' in str(e):
-            #         print('| WARNING: ran out of GPU memory, skipping batch')
-            #         torch.cuda.empty_cache()
-            #     else:
-            #         print(e)
-
-            loss_train += loss.detach().mean().item()
-        
-
-        return loss.detach().sum().item()
-
-
-
-# class Tester(object):
-#     def __init__(self, model):
-#         self.model = model
-
-#     def test(self, dataset):
-#         self.model.eval()
-#         N = len(dataset)
-#         T, Y, S = [], [], []
-#         with torch.no_grad():
-#             for data in dataset:
-#                 adjs, atoms, proteins, labels = [], [], [], []
-#                 atom, adj, protein, label = data
-#                 adjs.append(adj)
-#                 atoms.append(atom)
-#                 proteins.append(protein)
-#                 labels.append(label)
-#                 data = pack(atoms,adjs,proteins, labels, self.model.device)
-#                 correct_labels, predicted_labels, predicted_scores = self.model(data, train=False)
-#                 T.extend(correct_labels)
-#                 Y.extend(predicted_labels)
-#                 S.extend(predicted_scores)
-#         AUC = roc_auc_score(T, S)
-#         tpr, fpr, _ = precision_recall_curve(T, S)
-#         PRC = auc(fpr, tpr)
-#         return AUC, PRC
-
-#     def save_AUCs(self, AUCs, filename):
-#         with open(filename, 'a') as f:
-#             f.write('\t'.join(map(str, AUCs)) + '\n')
-
-#     def save_model(self, model, filename):
-#         torch.save(model.state_dict(), filename)
 
 class Tester(object):
     def __init__(self, model):
@@ -502,7 +465,8 @@ class Tester(object):
         #T, S, Y = torch.Tensor(), torch.Tensor(), torch.Tensor()
         T, S, Y = [], [], []
         with torch.no_grad():
-            for i, data_pack in enumerate(dataloader):
+            for i, data_pack in islice(enumerate(dataloader), 0, 500):
+            #for i, data_pack in enumerate(dataloader):
                 data_pack = to_cuda(data_pack, device=device)
 
                 _, correct_interaction, predicted_labels, predicted_scores = self.model(data_pack)
