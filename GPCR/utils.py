@@ -74,7 +74,7 @@ class ProteinCompoundDataset(Dataset):
 
 
 
-def pack(atoms, adjs, proteins, labels):
+def pack(atoms, adjs, proteins, labels=None):
     atoms_len = 0
     proteins_len = 0
 
@@ -120,6 +120,8 @@ def pack(atoms, adjs, proteins, labels):
 
     labels_new = torch.zeros(N)
     i = 0
+    if labels is None:
+        return atoms_new, adjs_new, proteins_new, atom_num, protein_num
     for label in labels:
         labels_new[i] = label
         i += 1
@@ -130,6 +132,9 @@ def collate_fn(batch):
     """
     Args batch: list of data, each atom, adj, protein, label = data
     """
+    if len(batch[0]) == 3:
+        atoms, adjs, proteins = zip(*batch)
+        return pack(atoms, adjs, proteins)
     atoms, adjs, proteins, labels = zip(*batch)
     return pack(atoms, adjs, proteins, labels)
 

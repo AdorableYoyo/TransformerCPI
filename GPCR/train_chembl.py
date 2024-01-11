@@ -30,10 +30,10 @@ if __name__ =="__main__":
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--train_data', type=str, default='/raid/home/yoyowu/TransformerCPI/dataset/chembl/all_Chembl29.tsv', help='training data path')
     parser.add_argument('--unl_data', type=str, default='/raid/home/yoyowu/TransformerCPI/dataset/hmdb/hmdb_target_sample.tsv', help='unlabeled data path')
-    parser.add_argument('--val_data', type=str, default='/raid/home/yoyowu/TransformerCPI/dataset/hmdb/Feb_13_23_dev_test/dev_47.tsv', help='validation data path')
-    parser.add_argument('--test_data', type=str, default='/raid/home/yoyowu/TransformerCPI/dataset/hmdb/Feb_13_23_dev_test/test_47.tsv', help='test data path')
+    parser.add_argument('--val_data', type=str, default='/raid/home/yoyowu/TransformerCPI/dataset/hmdb/Feb_13_23_dev_test/dev_27.tsv', help='validation data path')
+    parser.add_argument('--test_data', type=str, default='/raid/home/yoyowu/TransformerCPI/dataset/hmdb/Feb_13_23_dev_test/test_27.tsv', help='test data path')
     parser.add_argument('--iteration', type=int, default=100, help='number of iteration')
-    parser.add_argument('--batch', type=int, default=16, help='batch size')
+    parser.add_argument('--batch', type=int, default=8, help='batch size')
     parser.add_argument('--chembl_smiles_path', type=str, default='/raid/home/yoyowu/TransformerCPI/dataset/chembl/chembl2smiles.tsv', help='smiles path')
     parser.add_argument('--chembl_protein_path', type=str, default='/raid/home/yoyowu/TransformerCPI/dataset/chembl/10022023_chembl_prot_seq.json', help='protein path')
     parser.add_argument('--chembl_uniprot_mapping_path', type=str, default='/raid/home/yoyowu/TransformerCPI/dataset/chembl/chembl_uniprot_mapping.json', help='chembl_uniprot_mapping path')
@@ -42,7 +42,7 @@ if __name__ =="__main__":
     parser.add_argument("--hmdb_uniprot_mapping_path", type=str, default='/raid/home/yoyowu/TransformerCPI/dataset/hmdb/hmdb_uniprot_mapping.json', help='hmdb_uniprot_mapping path')
     parser.add_argument('--patience', type=int, default=100, help='Patience for early stopping')
     parser.add_argument('--model_save_path', type=str, default='/raid/home/yoyowu/TransformerCPI/saved_model', help='save model path')
-    parser.add_argument('--wandb', type=bool, default=True, help='use wandb or not')
+    parser.add_argument('--wandb', type=bool, default=False, help='use wandb or not')
     parser.add_argument('--amp', type=bool, default=True, help='use mix precision training or not')
     parser.add_argument('--num_workers',type=int, default=40)
     parser.add_argument('--from_checkpoint', type=str, default=None, help='load model from checkpoint')
@@ -93,6 +93,7 @@ if __name__ =="__main__":
     tr_dataset = ProteinCompoundDataset(tr_data,  chembl_smiles_mapping, chembl_protein_seq_mapping, chembl_uniprot_mapping)
     unl_dataset = ProteinCompoundDataset(unl_data, hmdb_smiles_mapping, hmdb_protein_seq_mapping, hmdb_uniprot_mapping, unlabeled=True)
     tr_dataloader = DataLoader(tr_dataset, batch_size=args.batch, shuffle=shuffle_dataset, num_workers=num_workers, drop_last=True, collate_fn=collate_fn)
+    unl_dataloader = DataLoader(unl_dataset, batch_size=args.batch, shuffle=shuffle_dataset, num_workers=num_workers, drop_last=True, collate_fn=collate_fn)
     val_dataset = ProteinCompoundDataset(val_data, hmdb_smiles_mapping, hmdb_protein_seq_mapping, hmdb_uniprot_mapping)
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch, shuffle=shuffle_dataset, num_workers=num_workers, drop_last=False, collate_fn=collate_fn)
     test_dataset = ProteinCompoundDataset(test_data, hmdb_smiles_mapping, hmdb_protein_seq_mapping, hmdb_uniprot_mapping)
@@ -100,12 +101,14 @@ if __name__ =="__main__":
 
     encoder = Encoder(protein_dim, hid_dim, n_layers, kernel_size, dropout, device)
     decoder = Decoder(atom_dim, hid_dim, n_layers, n_heads, pf_dim, DecoderLayer, SelfAttention, PositionwiseFeedforward, dropout, device)
-    model = Predictor(encoder, decoder, device)
+    student_model = Predictor(encoder, decoder, device)
+    teacher_model = Predictor(encoder, decoder, device)
 
-    model.to(device)
+    student_model.to(device)
+    teacher_model.to(device)
     #model = nn.DataParallel(model)
-    trainer = Trainer(model, lr, weight_decay, args.batch, args.amp, args.from_checkpoint)
-    tester = Tester(model)
+    trainer = Trainer(teacher_model,student_model, lr, weight_decay, args.amp, args.from_checkpoint)
+    tester = Tester(student_model)
     # Early Stopping Variables
     best_auc_val = 0
     best_auc_test = 0
@@ -120,7 +123,7 @@ if __name__ =="__main__":
     print("The current configuration is: {}".format(args))
     for epoch in range(1, args.iteration+1):
         start_time = time.time()  # Start the timer
-        loss_train = trainer.train(tr_dataloader, device)
+        s_loss_train, t_loss_train = trainer.train(tr_dataloader, unl_dataloader, device)
         #Test on training data (if needed)
         AUC_tr, PRC_tr = tester.test(tr_dataloader, device)
         # Test on validation data
@@ -129,7 +132,8 @@ if __name__ =="__main__":
         AUC_test, PRC_test = tester.test(test_dataloader, device)
         if args.wandb:
             wandb.log({
-                "loss_train": loss_train,
+                "loss_train": s_loss_train,
+                "teacher_loss_train": t_loss_train,
                 "AUC_tr": AUC_tr,
                 "PRC_tr": PRC_tr,
                 "AUC_val": AUC_val,
@@ -144,7 +148,7 @@ if __name__ =="__main__":
             epochs_no_improve = 0
             #Save the model if desired
             if args.model_save_path is not None:
-                torch.save(model.state_dict(), str(args.model_save_path)+'/'+str(args.run_name)+'.pt')
+                torch.save(student_model.state_dict(), str(args.model_save_path)+'/'+str(args.run_name)+'.pt')
                 print("Model saved at {}. Best AUC: {}".format(args.model_save_path, best_auc_val))
         
         else:
@@ -159,7 +163,8 @@ if __name__ =="__main__":
 
         epoch_results = {
             "epoch": epoch,
-            "loss_train": loss_train,
+            "loss_train": s_loss_train,
+            "teacher_loss_train": t_loss_train,
             "AUC_tr": AUC_tr,
             "PRC_tr": PRC_tr,
             "AUC_val": AUC_val,

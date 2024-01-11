@@ -291,7 +291,14 @@ class Predictor(nn.Module):
 
 
     def forward(self, data):
-        compound, adj, protein, correct_interaction, atom_num, protein_num = data
+        if len(data) == 5:
+            compound, adj, protein, atom_num,  protein_num = data
+            correct_interaction = None
+        elif len(data) == 6:
+            compound, adj, protein, correct_interaction, atom_num, protein_num = data
+        else:
+            raise ValueError("data length is not correct")
+        
         # compound = [batch,atom_num, atom_dim]
         # adj = [batch,atom_num, atom_num]
         # protein = [batch,protein len, 100]
@@ -311,12 +318,17 @@ class Predictor(nn.Module):
         predicted_interaction = self.decoder(compound, enc_src, compound_mask, protein_mask)
         # out = [batch size, 2]
         # out = torch.squeeze(out, dim=0)
-        correct_interaction = correct_interaction.long()
+        if correct_interaction is not None:
+            correct_interaction = correct_interaction.long()
         ys = F.softmax(predicted_interaction, 1).to('cpu').data.numpy()
         predicted_labels = np.argmax(ys, axis=1)
         predicted_scores = ys[:, 1]
-        loss = self.Loss(predicted_interaction, correct_interaction)
-        return loss, correct_interaction, predicted_labels, predicted_scores
+        return predicted_interaction, correct_interaction, predicted_labels, predicted_scores
+        # if pseudo_label is None:
+        #     loss = self.Loss(predicted_interaction, correct_interaction)
+        # else:
+        #     loss = nn.BCEWithLogitsLoss()(predicted_interaction, correct_interaction)
+        # return loss, correct_interaction, predicted_interaction, predicted_labels, predicted_scores
 
 
     # def __call__(self, data, train=True):
@@ -387,7 +399,11 @@ def pack(atoms, adjs, proteins, labels, device):
         i += 1
     return (atoms_new, adjs_new, proteins_new, labels_new, atom_num, protein_num)
 def to_cuda(data, device, cuda_available=True):
-    compound, adj, protein, correct_interaction, atom_num, protein_num = data
+    if len(data) == 5:
+        compound, adj, protein, atom_num,  protein_num = data
+        correct_interaction = None
+    else:
+        compound, adj, protein, correct_interaction, atom_num, protein_num = data
 
     # Put input to cuda
     if cuda_available:
@@ -396,62 +412,126 @@ def to_cuda(data, device, cuda_available=True):
         protein = protein.to(device)
         atom_num = atom_num.to(device)
         protein_num = protein_num.to(device)
-        correct_interaction = correct_interaction.to(device)
+        if correct_interaction is not None:
+            correct_interaction = correct_interaction.to(device)
 
     return compound, adj, protein, correct_interaction, atom_num, protein_num
 
 class Trainer(object):
-    def __init__(self, model, lr, weight_decay, batch, amp, checkpoint=None):
-        self.model = model
+    def __init__(self, teacher_model, student_model, lr, weight_decay, amp, checkpoint=None):
+        self.teacher_model = teacher_model
+        self.student_model = student_model
         # w - L2 regularization ; b - not L2 regularization
         weight_p, bias_p = [], []
         self.amp = amp
+        self.temperature = 0.7
 
-        for p in self.model.parameters():
+        for p in self.teacher_model.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
         if checkpoint is not None:
             #self.model.load_state_dict(checkpoint)
-            self.model.load_state_dict(torch.load(checkpoint))
+            self.teacher_model.load_state_dict(torch.load(checkpoint))
             print('load model from checkpoint {}'.format(checkpoint))
-        for name, p in self.model.named_parameters():
+
+        # Splitting the parameters for weight decay differentiation
+        t_weight_p, t_bias_p = self._split_parameters(self.teacher_model)
+        s_weight_p, s_bias_p = self._split_parameters(self.student_model)
+        
+        # Optimizers
+        self.t_optimizer = self._init_optimizer(t_weight_p + t_bias_p + s_weight_p + s_bias_p, lr, weight_decay)
+        self.s_optimizer = self._init_optimizer(s_weight_p + s_bias_p, lr, weight_decay)
+
+    def _split_parameters(self, model):
+        weight_p, bias_p = [], []
+        for name, p in model.named_parameters():
             if 'bias' in name:
                 bias_p += [p]
             else:
                 weight_p += [p]
-        # self.optimizer = optim.Adam([{'params': weight_p, 'weight_decay': weight_decay}, {'params': bias_p, 'weight_decay': 0}], lr=lr)
-        self.optimizer_inner = RAdam(
+        return weight_p, bias_p
+    
+    def _init_optimizer(self, parameters, lr, weight_decay):
+        weight_p, bias_p = [], []
+        for param in parameters:
+            if param.dim() > 1:
+                weight_p.append(param)
+            else:
+                bias_p.append(param)
+
+        optimizer_inner = RAdam(
             [{'params': weight_p, 'weight_decay': weight_decay}, {'params': bias_p, 'weight_decay': 0}], lr=lr)
-        self.optimizer = Lookahead(self.optimizer_inner, k=5, alpha=0.5)
-        self.batch = batch
+        optimizer = Lookahead(optimizer_inner, k=5, alpha=0.5)
+        return optimizer
+
+
+        # for name, p in self.teacher_model.named_parameters():
+        #     if 'bias' in name:
+        #         bias_p += [p]
+        #     else:
+        #         weight_p += [p]
+        # # self.optimizer = optim.Adam([{'params': weight_p, 'weight_decay': weight_decay}, {'params': bias_p, 'weight_decay': 0}], lr=lr)
+        # self.optimizer_inner = RAdam(
+        #     [{'params': weight_p, 'weight_decay': weight_decay}, {'params': bias_p, 'weight_decay': 0}], lr=lr)
+        # self.optimizer = Lookahead(self.optimizer_inner, k=5, alpha=0.5)
+       
  
 
-    def train(self, dataloader, device):
-        scaler = GradScaler()
-        self.model.train()
+    def train(self, dataloader, unl_dataloader, device):
+        s_scaler = GradScaler()
+        t_scaler = GradScaler()
+        self.teacher_model.train()
+        self.student_model.train()
 
-        total_loss = 0.0
+        s_total_loss = 0.0
+        t_total_loss = 0.0
         num_batches = 0
+
+        #Create an iterator for the unlabeled dataloader
+        unl_iterator = iter(unl_dataloader)
         #for i, data_pack in enumerate(dataloader):
         # sample few batches
         for i, data_pack in islice(enumerate(dataloader), 0, 1000):
             data_pack = to_cuda(data_pack, device=device)
-            self.optimizer.zero_grad()
+            try :
+                # try to get a batch from the unlabeled dataloader
+                unl_data= next(unl_iterator)
+            except StopIteration:
+                unl_iterator = iter(unl_dataloader)
+                unl_data = next(unl_iterator)
+            unl_data = to_cuda(unl_data, device=device)
+
+            self.t_optimizer.zero_grad()
+            self.s_optimizer.zero_grad()
             if self.amp:
                 with autocast():  # Enable mixed precision for the forward pass
-                    loss, _, _, _ = self.model(data_pack)
+                    t_logits, _, _, _= self.teacher_model(unl_data)
+                    pseudo_labels = torch.softmax(t_logits.detach() / self.temperature, dim=-1) # apply temperature on the soft lbs
+                    s_logits, labels, _, _ = self.student_model(data_pack)
+                    s_loss = nn.BCEWithLogitsLoss()(s_logits, pseudo_labels)
+
+                    #loss, correct_interaction, predicted_labels, predicted_scores
             #Backward pass and optimization using the scaler
-                scaler.scale(loss).backward()
-                scaler.step(self.optimizer)
-                scaler.update()
+                s_scaler.scale(s_loss).backward()
+                s_scaler.step(self.s_optimizer)
+                s_scaler.update()
+                with autocast():
+                    s_logits_new, _, _, _ = self.student_model(data_pack)
+                    t_loss = torch.nn.CrossEntropyLoss()(s_logits_new, labels)
+                t_scaler.scale(t_loss).backward()
+                t_scaler.step(self.t_optimizer)
+                t_scaler.update()
             else:
-                loss, _, _, _ = self.model(data_pack)
-                loss.backward()
-                self.optimizer.step()
-            total_loss += loss.item()
+                print("no amp")
+                # loss, _, _, _ = self.model(data_pack)
+                # loss.backward()
+                # self.optimizer.step()
+            s_total_loss += s_loss.item()
+            t_total_loss += t_loss.item()
             num_batches += 1
-        average_loss = total_loss / num_batches
-        return average_loss     
+        s_average_loss = s_total_loss / num_batches
+        t_average_loss = t_total_loss / num_batches
+        return s_average_loss , t_average_loss   
          
 
 
